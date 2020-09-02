@@ -1,0 +1,116 @@
+library 'pipeline-library@master'
+def hugoPodYaml = libraryResource 'podtemplates/hugo/pod.yml'
+def prNumber
+pipeline {
+  agent {
+    kubernetes {
+      label 'hugo-builder'
+      yaml hugoPodYaml
+    }
+  }
+  options { 
+    buildDiscarder(logRotator(numToKeepStr: '2'))
+    skipDefaultCheckout true
+    preserveStashes(buildCount: 2)
+  }
+  triggers {
+    eventTrigger jmespathQuery("action=='closed' && repository.full_name=='${repoOwner}/${repo}'")
+  }
+  environment {
+    repoOwner = "${repoOwner}"
+    repo = "${repo}"
+  }
+  stages {
+    stage("Checkout") {
+      steps {
+        checkout scm
+      }
+    } 
+    stage('Preview environment') {
+      when {
+        allOf {
+          not { triggeredBy 'EventTriggerCause' }
+          branch 'pr-*'
+        }
+      }
+      stages {
+        stage("Build site") {
+          steps {
+            container('hugo') {
+              sh "hugo"
+              stash name: "public", includes: "public/**"
+            }
+          }
+        }
+        stage("Build and push image") {
+          steps {
+            containerBuildPushGeneric("${projectName}", "${BRANCH_NAME.toLowerCase()}", "${gcpProject}"){
+              checkout scm
+              unstash "public"
+            }
+          }
+        }
+        stage("Deploy to preview env") {
+          steps {
+            cloudRunDeploy(serviceName: "${projectName}-${BRANCH_NAME.toLowerCase()}", image: "gcr.io/${gcpProject}/${projectName}:${BRANCH_NAME.toLowerCase()}", deployType: "${deployTypePR}", region: "${gcpRegionPR}", clusterName: "${clusterNamePR}", namespace: "${namespacePR}")
+          }
+        }
+      }
+    }
+    stage('Master build & deploy') {
+      when {
+        allOf {
+          not { triggeredBy 'EventTriggerCause' }
+          branch 'cbci-updates'
+          anyOf {
+            changeset "${sourceDir}/**"
+            triggeredBy 'UserIdCause'
+          }
+        }
+      }
+      stages {
+        stage("Build site") {
+          steps {
+            sh "git submodule update --init"
+            dir("${sourceDir}") {
+              container('hugo') {
+                sh "hugo --baseURL ${baseUrl}"
+                stash name: "public", includes: "public/**"
+              }
+            }
+          }
+        }
+        stage("Deploy") {
+          steps {
+            gcpCloudStorageDeploy("${bucketName}", "${bucketFolderName}") {
+              unstash "public"
+            }
+          }
+        }
+      }
+    }  
+    stage('PR Delete') {
+      agent {
+        kubernetes {
+          label 'default-jnlp'
+        }
+      }
+      when {
+        beforeAgent true
+        allOf {
+          branch 'master'
+          triggeredBy 'EventTriggerCause' 
+        }
+      }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'cli-username-token', usernameVariable: 'JENKINS_CLI_USR', passwordVariable: 'JENKINS_CLI_PSW')]) {
+          script {
+            prNumber = sh (script: "curl -u $JENKINS_CLI_USR:$JENKINS_CLI_PSW --silent ${BUILD_URL}api/json | jq -r '.actions[0].causes[0].event.number' | tr -d '\n'", 
+                returnStdout: true)
+          }
+        }
+        cloudRunDelete(serviceName: "${projectName}-pr-${prNumber}", deployType: "${deployTypePR}", region: "${gcpRegionPR}", clusterName: "${clusterNamePR}", namespace: "${namespacePR}")
+      }
+    }
+  }
+}
